@@ -18,6 +18,7 @@ DB_PATH = "companies_house_shared_shareholder.db"
 SEARCH_PAGE_SIZE = 5000
 PSC_PAGE_SIZE = 100
 COMPANY_SEARCH_PAGE_SIZE = 100
+MAX_SEARCH_RESULTS_PER_PSC = 30  # Cap to avoid huge fan-out
 
 ALLOWED_COMPANY_TYPES = [
     "ltd",
@@ -28,7 +29,6 @@ ALLOWED_COMPANY_TYPES = [
 
 
 def normalize_name(value: Any) -> str:
-    """Exact-match key after harmless formatting normalisation only."""
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value).strip()).upper()
@@ -180,6 +180,16 @@ def init_db() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shareholder_search_cache (
+            shareholder_key TEXT PRIMARY KEY,
+            shareholder_name TEXT NOT NULL,
+            search_done_at TEXT NOT NULL,
+            search_count INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_review_history_date ON review_history(incorporation_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_company_pscs_shareholder ON company_pscs(shareholder_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_shareholder_cache_key ON shareholder_company_cache(shareholder_key)")
@@ -298,7 +308,6 @@ def get_all_pscs(client: CHClient, company_number: str) -> List[Dict[str, Any]]:
 
 
 def extract_named_pscs(pscs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """Uses PSC names exactly, aside from trimming/case normalisation for matching."""
     result: List[Dict[str, str]] = []
     seen: Set[Tuple[str, str]] = set()
     for psc in pscs:
@@ -322,8 +331,12 @@ def extract_named_pscs(pscs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     return result
 
 
-def company_search_for_shareholder(client: CHClient, shareholder_name: str, shareholder_key: str) -> List[Dict[str, str]]:
-    """Searches Companies House for UK companies matching the exact PSC name, then verifies PSC membership company-by-company."""
+def company_search_for_shareholder(
+    client: CHClient,
+    shareholder_name: str,
+    shareholder_key: str,
+    max_results: int = MAX_SEARCH_RESULTS_PER_PSC,
+) -> List[Dict[str, str]]:
     search_items = paged_get_items(
         client,
         "/search/companies",
@@ -331,7 +344,10 @@ def company_search_for_shareholder(client: CHClient, shareholder_name: str, shar
         {"q": shareholder_name},
     )
     matches: List[Dict[str, str]] = []
+    checked = 0
     for company in search_items:
+        if checked >= max_results:
+            break
         company_number = str(company.get("company_number") or "")
         company_name = str(company.get("title") or company.get("company_name") or "")
         if not company_number:
@@ -350,6 +366,7 @@ def company_search_for_shareholder(client: CHClient, shareholder_name: str, shar
                     "profile_url": make_company_profile_url(company_number, company_name),
                 }
             )
+        checked += 1
     return matches
 
 
@@ -380,6 +397,21 @@ def cache_shareholder_companies(
             )
             for company in companies
         ],
+    )
+    conn.commit()
+
+
+def mark_shareholder_searched(conn: sqlite3.Connection, shareholder_name: str, shareholder_key: str) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO shareholder_search_cache (shareholder_key, shareholder_name, search_done_at, search_count)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(shareholder_key) DO UPDATE SET
+            search_done_at = excluded.search_done_at,
+            search_count = shareholder_search_cache.search_count + 1
+        """,
+        (shareholder_key, shareholder_name, now),
     )
     conn.commit()
 
@@ -524,7 +556,9 @@ def main() -> None:
             progress = st.progress(0)
             total = max(len(to_review), 1)
             processed = 0
-            shared_matches = 0
+            psc_searches_run = 0
+            psc_with_additional = 0
+
             for index, item in enumerate(to_review, start=1):
                 company_number = str(item.get("company_number") or "unknown")
                 incorporation_date = str(item.get("date_of_creation") or item.get("incorporation_date") or "")
@@ -544,10 +578,19 @@ def main() -> None:
                     replace_company_pscs(conn, company_number, pscs)
 
                     for psc in pscs:
-                        related = company_search_for_shareholder(client, psc["shareholder_name"], psc["shareholder_key"])
-                        cache_shareholder_companies(conn, psc["shareholder_name"], psc["shareholder_key"], related)
-                        if any(company["company_number"] != company_number for company in related):
-                            shared_matches += 1
+                        key = psc["shareholder_key"]
+                        existing = conn.execute(
+                            "SELECT search_done_at FROM shareholder_search_cache WHERE shareholder_key = ?", (key,)
+                        ).fetchone()
+                        if existing is None:
+                            related = company_search_for_shareholder(client, psc["shareholder_name"], key)
+                            cache_shareholder_companies(conn, psc["shareholder_name"], key, related)
+                            mark_shareholder_searched(conn, psc["shareholder_name"], key)
+                            psc_searches_run += 1
+                            if any(company["company_number"] != company_number for company in related):
+                                psc_with_additional += 1
+                        else:
+                            pass
 
                     record_review(conn, company_number, incorporation_date)
                     processed += 1
@@ -557,7 +600,8 @@ def main() -> None:
                 progress.progress(min(index / total, 1.0))
 
             st.write(f"Companies reviewed: {processed:,}")
-            st.write(f"PSC names with at least one additional company found: {shared_matches:,}")
+            st.write(f"Distinct PSC searches performed this run: {psc_searches_run:,}")
+            st.write(f"PSC names with at least one additional company found: {psc_with_additional:,}")
             if failures:
                 st.warning(f"Failed reviews: {len(failures):,}")
                 st.code("\n".join(failures[:50]))
@@ -630,9 +674,10 @@ def main() -> None:
     with st.expander("How matching and repeat screening work"):
         st.markdown("""
 - The app fetches named PSCs for each newly incorporated company in the selected range.
-- It searches Companies House for each PSC name, then verifies an exact PSC-name match against every returned UK company before treating it as an additional company.
+- For each PSC name, it searches Companies House and verifies an exact PSC-name match against up to 30 companies to keep runtimes reasonable.
 - The original company is shown only when at least one named PSC is verified on another company.
 - `review_history` records every reviewed company, including no-match results, so normal repeat runs only process companies not previously screened.
+- `shareholder_search_cache` remembers which PSC names have already been searched; subsequent runs reuse cached results unless you explicitly re-screen.
 - Enable **Re-screen companies already reviewed** only when you intentionally want to refresh historical checks.
 - SIC codes are shown only as reference data and are never used as filters.
         """)
