@@ -1,8 +1,7 @@
 import json
 import re
-import sqlite3
 import time
-from datetime import date, datetime
+from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
@@ -13,7 +12,6 @@ import streamlit as st
 st.set_page_config(page_title="Companies House Shared Shareholder Screener", layout="wide")
 
 BASE_URL = "https://api.company-information.service.gov.uk"
-DB_PATH = "companies_house_screening.db"
 SEARCH_PAGE_SIZE = 5000
 OFFICERS_PAGE_SIZE = 100
 PSC_PAGE_SIZE = 100
@@ -34,6 +32,503 @@ MANUFACTURING_WHOLESALE_SIC_CODES = {
     "46120", "46130", "46140", "46150", "46160", "46170", "46180", "46190", "46210", "46220", "46230",
     "46240", "46310", "46320", "46330", "46341", "46342", "46350", "46360", "46370", "46380", "46390",
     "46410", "46420", "46431", "46439", "46440", "46450", "46460", "46470", "46480", "46499", "46510",
+    "46520", "46530", "46610", "46620", "46630", "46640", "46650", "46660", "46690", "46711", "46719",
+    "46720", "46730", "46740", "46750", "46900",
+}
+ALL_ALLOWED_SIC_CODES = sorted({*ALLOWED_SIC_CODES, *MANUFACTURING_WHOLESALE_SIC_CODES})
+ALLOWED_COMPANY_TYPES = [
+    "ltd", "llp", "private-limited-guarant-nsc", "private-limited-shares-section-30-exemption",
+]
+
+COUNTRY_TERMS = {
+    "usa", "united states", "united states of america", "france", "germany", "belgium", "norway",
+    "sweden", "finland", "denmark", "austria", "poland", "spain", "portugal", "greece", "italy",
+    "hungary", "croatia", "ireland", "china", "netherlands", "india", "hong kong", "singapore",
+}
+NATIONALITY_TO_COUNTRY = {
+    "american": "united states", "us": "united states", "united states": "united states",
+    "french": "france", "german": "germany", "belgian": "belgium", "norwegian": "norway",
+    "swedish": "sweden", "finnish": "finland", "danish": "denmark", "austrian": "austria",
+    "polish": "poland", "spanish": "spain", "portuguese": "portugal", "greek": "greece",
+    "italian": "italy", "hungarian": "hungary", "croatian": "croatia", "irish": "ireland",
+    "chinese": "china", "indian": "india", "hong kong": "hong kong", "hongkong": "hong kong",
+    "singaporean": "singapore", "dutch": "netherlands", "netherlands": "netherlands",
+}
+COMPANY_OWNER_KINDS = {
+    "corporate-entity-person-with-significant-control",
+    "legal-person-person-with-significant-control",
+    "super-secure-person-with-significant-control",
+}
+COUNTRY_FLAG_MAP = {
+    "united states": "🇺🇸", "france": "🇫🇷", "germany": "🇩🇪", "belgium": "🇧🇪", "norway": "🇳🇴",
+    "sweden": "🇸🇪", "finland": "🇫🇮", "denmark": "🇩🇰", "austria": "🇦🇹", "poland": "🇵🇱",
+    "spain": "🇪🇸", "portugal": "🇵🇹", "greece": "🇬🇷", "italy": "🇮🇹", "hungary": "🇭🇺",
+    "croatia": "🇭🇷", "ireland": "🇮🇪", "china": "🇨🇳", "netherlands": "🇳🇱", "india": "🇮🇳",
+    "hong kong": "🇭🇰", "singapore": "🇸🇬",
+}
+
+
+def norm(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", " ")
+    text = re.sub(r"[^a-z0-9\s]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+NORMALIZED_COUNTRIES = {norm(value) for value in COUNTRY_TERMS}
+NORMALIZED_TYPES = {norm(value) for value in ALLOWED_COMPANY_TYPES}
+
+
+def country(value: Any) -> str:
+    value_norm = norm(value)
+    aliases = {
+        "usa": "united states", "united states of america": "united states",
+        "the netherlands": "netherlands", "hongkong": "hong kong",
+    }
+    value_norm = aliases.get(value_norm, value_norm)
+    if value_norm in NORMALIZED_COUNTRIES:
+        return value_norm
+    return NATIONALITY_TO_COUNTRY.get(value_norm, "")
+
+
+def unique(values: List[str]) -> List[str]:
+    result: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        key = norm(value)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result
+
+
+def country_name(value: str) -> str:
+    if value == "united states":
+        return "USA"
+    if value == "hong kong":
+        return "Hong Kong"
+    return value.title()
+
+
+def country_flags(values: List[str]) -> List[str]:
+    countries = unique([country(value) for value in values])
+    return [COUNTRY_FLAG_MAP[value] for value in countries if value in COUNTRY_FLAG_MAP]
+
+
+def country_display(values: List[str]) -> str:
+    countries = unique([country(value) for value in values])
+    return " | ".join(f"✓ {COUNTRY_FLAG_MAP.get(value, '🌍')} {country_name(value)}" for value in countries if value)
+
+
+def company_profile(number: str, name: str) -> str:
+    return f"https://find-and-update.company-information.service.gov.uk/company/{number}#{quote(name or 'company')}"
+
+
+class CompaniesHouseClient:
+    def __init__(self, api_keys: List[str]):
+        self.api_keys = [str(value).strip() for value in api_keys if str(value).strip()]
+        if not self.api_keys:
+            raise ValueError("No Companies House API keys supplied.")
+        self.key_index = 0
+        self.session = requests.Session()
+
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        last_error = "unknown error"
+        for _ in range(max(3, len(self.api_keys) * 3)):
+            try:
+                response = self.session.get(
+                    BASE_URL + path,
+                    params=params,
+                    auth=(self.api_keys[self.key_index], ""),
+                    headers={"Accept": "application/json"},
+                    timeout=30,
+                )
+                if response.status_code == 404:
+                    return {}
+                if response.status_code in (401, 403, 429):
+                    last_error = f"HTTP {response.status_code}"
+                    self.key_index = (self.key_index + 1) % len(self.api_keys)
+                    time.sleep(0.5)
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                self.key_index = (self.key_index + 1) % len(self.api_keys)
+                time.sleep(0.5)
+        raise RuntimeError(f"Companies House API request failed: {last_error}")
+
+
+def get_pages(client: CompaniesHouseClient, path: str, page_size: int, extra: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    start_index = 0
+    while True:
+        params: Dict[str, Any] = {"start_index": start_index}
+        if extra:
+            params.update(extra)
+        params["size" if path == "/advanced-search/companies" else "items_per_page"] = page_size
+        payload = client.get(path, params)
+        batch = payload.get("items", []) or []
+        items.extend(batch)
+        total = int(payload.get("total_results") or payload.get("total_count") or len(items))
+        start_index += page_size
+        if not batch or start_index >= total:
+            break
+    return items
+
+
+def get_officers(client: CompaniesHouseClient, number: str) -> List[Dict[str, Any]]:
+    return get_pages(client, f"/company/{number}/officers", OFFICERS_PAGE_SIZE)
+
+
+def get_pscs(client: CompaniesHouseClient, number: str) -> List[Dict[str, Any]]:
+    return get_pages(client, f"/company/{number}/persons-with-significant-control", PSC_PAGE_SIZE)
+
+
+def extract_psc_id(psc: Dict[str, Any]) -> str:
+    self_link = str((psc.get("links") or {}).get("self") or "").rstrip("/")
+    return self_link.split("/")[-1] if self_link else ""
+
+
+def extract_corporate_number(psc: Dict[str, Any]) -> str:
+    identification = psc.get("identification") or {}
+    for value in [psc.get("company_number"), identification.get("registration_number"), identification.get("company_number")]:
+        if value:
+            return str(value).strip().upper()
+    return ""
+
+
+def owner_key(psc: Dict[str, Any]) -> str:
+    corporate = extract_corporate_number(psc)
+    if corporate:
+        return f"corporate:{corporate}"
+    psc_identifier = extract_psc_id(psc)
+    if psc_identifier:
+        return f"psc:{str(psc.get('kind') or 'unknown').lower()}:{psc_identifier}"
+    return f"unmatched:{str(psc.get('kind') or 'unknown').lower()}:{json.dumps(psc, sort_keys=True, default=str)}"
+
+
+def is_individual(kind: Any) -> bool:
+    kind_value = str(kind or "").lower()
+    return "individual" in kind_value and "corporate" not in kind_value
+
+
+def validate_keys() -> List[str]:
+    if "COMPANIES_HOUSE_API_KEYS" not in st.secrets:
+        raise ValueError("Missing COMPANIES_HOUSE_API_KEYS in .streamlit/secrets.toml")
+    keys = [str(value).strip() for value in st.secrets["COMPANIES_HOUSE_API_KEYS"] if str(value).strip()]
+    if not keys:
+        raise ValueError("COMPANIES_HOUSE_API_KEYS is empty")
+    return keys
+
+
+def search_companies(client: CompaniesHouseClient, target_date: str) -> List[Dict[str, Any]]:
+    params = {
+        "incorporated_from": target_date,
+        "incorporated_to": target_date,
+        "company_status": "active",
+        "company_type": ",".join(ALLOWED_COMPANY_TYPES),
+        "sic_codes": ",".join(ALL_ALLOWED_SIC_CODES),
+    }
+    raw = get_pages(client, "/advanced-search/companies", SEARCH_PAGE_SIZE, params)
+    filtered = [
+        item for item in raw
+        if item.get("company_status", "").lower() == "active"
+        and norm(item.get("company_type")) in NORMALIZED_TYPES
+        and any(str(code) in ALL_ALLOWED_SIC_CODES for code in (item.get("sic_codes") or []))
+    ]
+    return list({item["company_number"]: item for item in filtered if item.get("company_number")}.values())
+
+
+def enrich_company(client: CompaniesHouseClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    number = str(item.get("company_number") or "")
+    name = str(item.get("company_name") or item.get("title") or "")
+    officers = get_officers(client, number)
+    pscs = get_pscs(client, number)
+
+    director_countries: List[str] = []
+    director_count = 0
+    for officer in officers:
+        role = norm(officer.get("officer_role"))
+        if "director" not in role and role != "designated member":
+            continue
+        director_count += 1
+        for value in [officer.get("country_of_residence"), (officer.get("address") or {}).get("country"), officer.get("nationality")]:
+            if country(value):
+                director_countries.append(str(value))
+
+    shareholder_countries: List[str] = []
+    parent_names: List[str] = []
+    international_shareholder = False
+    owned_by_company = False
+    current_pscs: List[Dict[str, Any]] = []
+    for psc in pscs:
+        if psc.get("ceased_on"):
+            continue
+        current_pscs.append(psc)
+        values = [psc.get("country_of_residence"), (psc.get("address") or {}).get("country"), psc.get("nationality")]
+        matched = [str(value) for value in values if country(value)]
+        shareholder_countries.extend(matched)
+        international_shareholder = international_shareholder or bool(matched)
+        kind = str(psc.get("kind") or "")
+        if kind in COMPANY_OWNER_KINDS or "corporate" in kind or "legal-person" in kind:
+            owned_by_company = True
+            psc_name = str(psc.get("name") or "").strip()
+            if psc_name:
+                parent_names.append(psc_name)
+
+    director_countries = unique(director_countries)
+    shareholder_countries = unique(shareholder_countries)
+    parent_names = unique(parent_names)
+    target_sic = any(str(code) in TARGET_SIC_CODES for code in (item.get("sic_codes") or []))
+    registered_address = item.get("registered_office_address") or item.get("address") or {}
+    registered_country = country(registered_address.get("country"))
+    target_address = bool(registered_country)
+
+    indicators: List[str] = []
+    if target_sic:
+        indicators.append("🎯")
+    if target_address:
+        indicators.append("🏳️")
+    indicators.extend(unique(country_flags(director_countries) + country_flags(shareholder_countries)))
+    if director_count >= 2:
+        indicators.append(f"{director_count} directors")
+
+    stars = sum(bool(value) for value in [international_shareholder, bool(director_countries), owned_by_company, target_sic])
+    if {country(value) for value in director_countries + shareholder_countries} & {"sweden", "norway", "united states"}:
+        stars += 1
+
+    matching_sics = [str(code) for code in (item.get("sic_codes") or []) if str(code) in ALL_ALLOWED_SIC_CODES]
+    return {
+        "company_number": number,
+        "company_name": name,
+        "sic_code": ", ".join(matching_sics),
+        "company_type": item.get("company_type", ""),
+        "incorporation_date": item.get("date_of_creation", ""),
+        "profile_url": company_profile(number, name),
+        "international_director": bool(director_countries),
+        "international_director_detail": country_display(director_countries),
+        "international_shareholder": international_shareholder,
+        "international_shareholder_detail": country_display(shareholder_countries),
+        "owned_by_company": owned_by_company,
+        "parent_company_names": " | ".join(parent_names),
+        "target_sic": target_sic,
+        "target_address": target_address,
+        "target_address_detail": f"✓ {COUNTRY_FLAG_MAP.get(registered_country, '🌍')} {country_name(registered_country)}" if registered_country else "",
+        "target_indicators": " ".join(indicators),
+        "rating": "⭐" * stars,
+        "raw_company": item,
+        "pscs": current_pscs,
+        "shortlisted": False,
+    }
+
+
+def build_owner_groups(records: List[Dict[str, Any]]) -> Dict[str, List[Tuple[str, str, str]]]:
+    groups: Dict[str, List[Tuple[str, str, str]]] = {}
+    for record in records:
+        for psc in record.get("pscs", []):
+            key = owner_key(psc)
+            if key.startswith("unmatched:"):
+                continue
+            groups.setdefault(key, []).append((record["company_number"], record["company_name"], str(psc.get("name") or key)))
+    for key in groups:
+        groups[key] = list({number: (number, name, owner_name) for number, name, owner_name in groups[key]}.values())
+    return groups
+
+
+def add_associations(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups = build_owner_groups(records)
+    all_associations: Dict[str, Dict[str, str]] = {}
+    personal_associations: Dict[str, Dict[str, Dict[str, str]]] = {}
+
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        for number, name, owner_name in members:
+            for other_number, other_name, _ in members:
+                if other_number == number:
+                    continue
+                all_associations.setdefault(number, {})[other_number] = other_name
+                member_psc_types = [
+                    psc for record in records if record["company_number"] == number
+                    for psc in record.get("pscs", []) if owner_key(psc) == key and not psc.get("ceased_on")
+                ]
+                if any(is_individual(psc.get("kind")) for psc in member_psc_types):
+                    personal_associations.setdefault(number, {})[owner_name] = {
+                        "company_number": other_number,
+                        "company_name": other_name,
+                    }
+
+    enriched: List[Dict[str, Any]] = []
+    for record in records:
+        number = record["company_number"]
+        all_related = all_associations.get(number, {})
+        personal_related = personal_associations.get(number, {})
+        personal_companies = sorted(
+            {f"{value['company_name']} ({value['company_number']})" for value in personal_related.values()},
+            key=str.lower,
+        )
+        copy = dict(record)
+        copy["associated_count"] = len(all_related)
+        copy["associated_companies"] = " | ".join(
+            f"{name} ({other})" for other, name in sorted(all_related.items(), key=lambda item: item[1].lower())
+        )
+        copy["personal_associated_people"] = " | ".join(sorted(personal_related, key=str.lower))
+        copy["personal_associated_companies"] = " | ".join(personal_companies)
+        copy["personal_associated_count"] = len(personal_companies)
+        enriched.append(copy)
+    return enriched
+
+
+def display_records(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    columns = [
+        "Shortlist", "Target SIC", "Rating", "Target Indicators", "Company Name", "SIC Code", "Signals",
+        "International Director", "International Shareholder", "Owned By A Company", "Associated Companies",
+        "Associated Count", "Personal Shareholders Also In Other Businesses", "Personal Shareholder Other Companies",
+        "Personal Shareholder Company Count", "Profile", "Incorporation Date", "company_number",
+    ]
+    rows: List[Dict[str, Any]] = []
+    for record in records:
+        signals = country_flags(
+            str(record.get("international_director_detail", "")).split("|")
+            + str(record.get("international_shareholder_detail", "")).split("|")
+        )
+        if record.get("owned_by_company"):
+            signals.append("🏢")
+        if record.get("associated_count", 0):
+            signals.append("🔗")
+        if record.get("personal_associated_count", 0):
+            signals.append("👤")
+        rows.append({
+            "Shortlist": bool(record.get("shortlisted", False)),
+            "Target SIC": "🎯" if record.get("target_sic") else "",
+            "Rating": record.get("rating", ""),
+            "Target Indicators": record.get("target_indicators", ""),
+            "Company Name": record.get("company_name", ""),
+            "SIC Code": record.get("sic_code", ""),
+            "Signals": " ".join(unique(signals)),
+            "International Director": record.get("international_director_detail", ""),
+            "International Shareholder": record.get("international_shareholder_detail", ""),
+            "Owned By A Company": record.get("parent_company_names", ""),
+            "Associated Companies": record.get("associated_companies", ""),
+            "Associated Count": record.get("associated_count", 0),
+            "Personal Shareholders Also In Other Businesses": record.get("personal_associated_people", ""),
+            "Personal Shareholder Other Companies": record.get("personal_associated_companies", ""),
+            "Personal Shareholder Company Count": record.get("personal_associated_count", 0),
+            "Profile": record.get("profile_url", ""),
+            "Incorporation Date": record.get("incorporation_date", ""),
+            "company_number": record.get("company_number", ""),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def main() -> None:
+    st.title("Companies House Shared Shareholder Screener")
+    st.caption("In-memory Streamlit version: no SQL database or local persistence is used.")
+    st.info("The app compares companies pulled during the current Streamlit session. Refreshing the app clears the results.")
+
+    try:
+        api_keys = validate_keys()
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+
+    if "records" not in st.session_state:
+        st.session_state.records = []
+
+    client = CompaniesHouseClient(api_keys)
+    with st.sidebar:
+        target_date = st.date_input("Incorporation date", value=date.today(), format="YYYY-MM-DD")
+        pull = st.button("Pull new companies", type="primary", use_container_width=True)
+        clear = st.button("Clear current results", use_container_width=True)
+        personal_only = st.checkbox("Show shared personal shareholders only")
+        associated_only = st.checkbox("Show associated companies only")
+        hide_mfg = st.checkbox("Hide Manufacturing & Wholesale SICs")
+        company_search = st.text_input("Filter by company name")
+        sic_search = st.text_input("Filter by SIC code")
+
+    if clear:
+        st.session_state.records = []
+        st.rerun()
+
+    if pull:
+        target_date_text = target_date.strftime("%Y-%m-%d")
+        with st.status("Pulling and enriching Companies House records...", expanded=True) as status:
+            companies = search_companies(client, target_date_text)
+            existing_numbers = {record["company_number"] for record in st.session_state.records}
+            new_companies = [company for company in companies if company.get("company_number") not in existing_numbers]
+            st.write(f"Companies found: {len(companies):,}; new companies to enrich: {len(new_companies):,}")
+            progress = st.progress(0)
+            failures: List[str] = []
+            for index, item in enumerate(new_companies, start=1):
+                try:
+                    st.session_state.records.append(enrich_company(client, item))
+                except Exception as exc:
+                    failures.append(f"{item.get('company_number')}: {exc}")
+                progress.progress(index / max(len(new_companies), 1))
+            st.session_state.records = add_associations(st.session_state.records)
+            if failures:
+                st.warning("Some records failed to enrich.")
+                st.code("\n".join(failures[:50]))
+                status.update(label="Completed with errors", state="error")
+            else:
+                status.update(label="Refresh complete", state="complete")
+
+    if st.session_state.records:
+        st.session_state.records = add_associations(st.session_state.records)
+
+    filtered_records = list(st.session_state.records)
+    if personal_only:
+        filtered_records = [record for record in filtered_records if record.get("personal_associated_count", 0) > 0]
+    if associated_only:
+        filtered_records = [record for record in filtered_records if record.get("associated_count", 0) > 0]
+    if company_search.strip():
+        search_value = norm(company_search)
+        filtered_records = [record for record in filtered_records if search_value in norm(record.get("company_name"))]
+    if sic_search.strip():
+        filtered_records = [record for record in filtered_records if sic_search.strip() in str(record.get("sic_code", ""))]
+    if hide_mfg:
+        filtered_records = [
+            record for record in filtered_records
+            if not any(code.strip() in MANUFACTURING_WHOLESALE_SIC_CODES for code in str(record.get("sic_code", "")).split(","))
+        ]
+
+    display = display_records(filtered_records)
+    st.metric("Visible results", f"{len(display):,}")
+
+    edited = st.data_editor(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        disabled=[column for column in display.columns if column != "Shortlist"],
+        column_config={
+            "Shortlist": st.column_config.CheckboxColumn("Shortlist"),
+            "Associated Companies": st.column_config.TextColumn("Associated Companies", width="large"),
+            "Personal Shareholders Also In Other Businesses": st.column_config.TextColumn("Personal Shareholders Also In Other Businesses", width="medium"),
+            "Personal Shareholder Other Companies": st.column_config.TextColumn("Personal Shareholder Other Companies", width="large"),
+            "Personal Shareholder Company Count": st.column_config.NumberColumn("Personal Shareholder Company Count", width="small"),
+            "Profile": st.column_config.LinkColumn("Profile", display_text="Open record"),
+            "company_number": None,
+        },
+        key=f"results_{target_date}",
+    )
+
+    if not edited.empty:
+        shortlist_by_number = {row["company_number"]: bool(row["Shortlist"]) for _, row in edited.iterrows()}
+        for record in st.session_state.records:
+            if record["company_number"] in shortlist_by_number:
+                record["shortlisted"] = shortlist_by_number[record["company_number"]]
+
+    st.download_button(
+        "Download filtered CSV",
+        data=display.drop(columns=["company_number"], errors="ignore").to_csv(index=False).encode("utf-8"),
+        file_name=f"companies_house_shared_shareholders_{target_date}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
     "46520", "46530", "46610", "46620", "46630", "46640", "46650", "46660", "46690", "46711", "46719",
     "46720", "46730", "46740", "46750", "46900",
 }
